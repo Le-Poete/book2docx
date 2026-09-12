@@ -1,0 +1,17 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 扫描/工具产物
+.mimosa/
+
+# 转换输出样例（二进制产物不入库）
+*.docx
+*.pdf
+
+# IDE
+.idea/
+.vscode/
