@@ -91,6 +91,41 @@ def extract_words_pt(page: fitz.Page) -> list[W]:
     return words
 
 
+def dedup_lines(lines: list[Line], base_h: float) -> list[Line]:
+    """去掉 OCR 层的重复行（保守判据：垂直高度重叠 > 60%、水平重叠 > 50%，
+    且文本完全相同或短行为长行的子串。不使用模糊相似度，避免误删公式行。）"""
+    out: list[Line] = []
+    for ln in lines:
+        dup = False
+        for prev in out:
+            iy = min(ln.bbox[3], prev.bbox[3]) - max(ln.bbox[1], prev.bbox[1])
+            ix = min(ln.bbox[2], prev.bbox[2]) - max(ln.bbox[0], prev.bbox[0])
+            if iy <= 0:
+                continue
+            h_min = min(ln.bbox[3] - ln.bbox[1], prev.bbox[3] - prev.bbox[1])
+            w_min = min(ln.bbox[2] - ln.bbox[0], prev.bbox[2] - prev.bbox[0])
+            if iy / h_min < 0.6 or ix / w_min < 0.5:
+                continue
+            ta, tb = ln.text.strip(), prev.text.strip()
+            if not ta or not tb:
+                continue
+            if ta == tb:
+                dup = True
+                break
+            short, long = (ta, tb) if len(ta) < len(tb) else (tb, ta)
+            if len(short) >= 10 and short in long:
+                dup = True
+                break
+            if len(short) >= 12:
+                import difflib
+                if difflib.SequenceMatcher(None, ta, tb).ratio() >= 0.8:
+                    dup = True
+                    break
+        if not dup:
+            out.append(ln)
+    return out
+
+
 def extract_words_ocr(page: fitz.Page, dpi: int = 200) -> list[W]:
     """RapidOCR 识别（无文字层页面）→ 词块（pt）。"""
     from rapidocr_onnxruntime import RapidOCR
@@ -589,6 +624,10 @@ def classify_formula_line(ln: Line, base_h: float, bw: np.ndarray, zoom: float) 
         return False
     cr = _cjk_ratio(t)
 
+    # 过短行（如"件可得"等段落尾词）不判公式：这类行被判公式会把
+    # formula 块 bbox 顶进相邻正文区域，造成裁图与文本重复
+    if len(t) < 5:
+        return False
     # 纯中文行：正文（含"解""假设"等短标题）
     if cr > 0.85:
         return False

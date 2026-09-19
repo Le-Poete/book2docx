@@ -24,9 +24,9 @@ from .common import PageKind, classify_page
 from .docxkit import set_page, sanitize_xml_text
 from .segment import (Block, BlockKind, Line, W, binarize, classify_formula_line,
                       cluster_blocks, cluster_lines, dedup_lines, detect_grid_tables,
-                      detect_ink_regions, deskew, estimate_skew, get_words,
-                      ink_stats, render_gray, split_lines_by_gap, table_grid,
-                      transform_pt_bbox)
+                      detect_ink_regions, deskew, estimate_skew, extract_words_pt,
+                      get_words, ink_stats, render_gray, split_lines_by_gap,
+                      table_grid, transform_pt_bbox)
 
 _CODE_RE = __import__("re").compile(
     r"[A-Za-z_][A-Za-z0-9_]{2,}\s*\(|'[^']*'|\"[^\"]*\"|\bfor\b|\bif\b|\bwhile\b"
@@ -107,6 +107,7 @@ def analyze_page(page: fitz.Page, dpi: int = 300, reocr: bool = False) -> dict:
     med_h = float(np.median([l.h for l in lines]))
     base_h = med_h
     lines = split_lines_by_gap(lines, base_h)
+    lines = dedup_lines(lines, base_h)
 
     # 页眉页脚：页面上下 5.5% 内的行 → SKIP
     head_zone = pr.height * 0.055
@@ -183,6 +184,24 @@ def analyze_page(page: fitz.Page, dpi: int = 300, reocr: bool = False) -> dict:
                 groups[i - 1][1].sort(key=lambda l: l.bbox[1])
                 continue
             i += 1
+        # 夹在正文组之间的短公式组 → 回退为正文（行内公式的正文行，
+        # 如"设 i=1,2,3 分别表示…"；OCR 文本可读。乱码公式保持裁图）
+        i = 1
+        while i < len(groups) - 1:
+            k, ls = groups[i]
+            joined = "".join(l.text for l in ls)
+            n_ascii = sum(1 for c in joined if c.isascii())
+            if (k == "f" and len(ls) <= 2
+                    and groups[i - 1][0] == "t" and groups[i + 1][0] == "t"
+                    and max(len(l.text) for l in ls) <= 55
+                    and n_ascii >= len(joined) * 0.7):
+                groups[i] = ("t", ls)
+                if groups[i - 1][0] == "t":
+                    groups[i - 1][1].extend(ls)
+                    groups[i - 1][1].sort(key=lambda l: l.bbox[1])
+                    del groups[i]
+                continue
+            i += 1
         # 代码传播：紧邻代码组的行组若是碎片（OCR 读碎的代码行）→ 并入代码
         i = 0
         while i < len(groups):
@@ -213,7 +232,7 @@ def analyze_page(page: fitz.Page, dpi: int = 300, reocr: bool = False) -> dict:
             prev = merged[-1]
             x_ov = min(prev.bbox[2], blk.bbox[2]) - max(prev.bbox[0], blk.bbox[0])
             gap = blk.bbox[1] - prev.bbox[3]
-            if x_ov > -base_h and gap < base_h * 0.9:
+            if x_ov > -base_h and gap < base_h * 1.8:
                 prev.lines.extend(blk.lines)
                 prev.lines.sort(key=lambda l: l.bbox[1])
                 prev.bbox = _bbox_of_lines(prev.lines)
@@ -403,7 +422,7 @@ def _join_lines(prev: str, nxt: str) -> str:
 
 
 def expand_to_ink(img: np.ndarray, bbox_pt: list, zoom: float,
-                  max_h: float = 4.0, max_v: float = 2.0) -> list:
+                  max_h: float = 10.0, max_v: float = 2.0) -> list:
     """公式 bbox 向四周扩展到墨迹边界（限幅），补回 OCR 漏识别的符号。"""
     H, W = img.shape
     dark = img < 185
@@ -482,7 +501,8 @@ def _para_spacing(p, before_pt=0, after_pt=0, line_mult=None, exact_pt=None):
         pf.line_spacing = line_mult
 
 
-def build_table(document, blk: Block, img, zoom: float, base_h: float):
+def build_table(document, blk: Block, img, zoom: float, base_h: float,
+                words: list[W]):
     from .segment import rapidocr
     row_ys, col_xs = table_grid(img, zoom, blk.bbox)
     if len(row_ys) < 2 or len(col_xs) < 2:
@@ -531,6 +551,22 @@ def build_table(document, blk: Block, img, zoom: float, base_h: float):
                 if 0 <= ri < rows and 0 <= ci < cols:
                     cell_words.setdefault((ri, ci), []).append(
                         W(gx0, gy0, gx1, gy1, t, (gy1 - gy0) * 0.85, float(conf)))
+
+    # RapidOCR 漏识别的空单元格 → 用 PDF 文字层词兜底
+    for (i, j), ws in list(cell_words.items()):
+        pass
+    for i in range(rows):
+        for j in range(cols):
+            if (i, j) in cell_words and cell_words[(i, j)]:
+                continue
+            cx0, cy0 = col_xs[j], row_ys[i]
+            cx1, cy1 = col_xs[j + 1], row_ys[i + 1]
+            fallback = [wd for wd in words
+                        if cx0 <= (wd.x0 + wd.x1) / 2 < cx1
+                        and cy0 <= (wd.y0 + wd.y1) / 2 < cy1]
+            if fallback:
+                cell_words[(i, j)] = sorted(fallback,
+                                            key=lambda w: (w.y0, w.x0))
 
     for i in range(rows):
         for j in range(cols):
@@ -615,7 +651,8 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
             continue
 
         if blk.kind == BlockKind.TABLE:
-            ok = build_table(document, blk, img, zoom, base_h)
+            ok = build_table(document, blk, img, zoom, base_h,
+                             analysis.get("words", []))
             nxt = all_blocks[bi + 1] if bi + 1 < len(all_blocks) else None
             if nxt and nxt.kind == BlockKind.TABLE:
                 document.add_paragraph()   # 防止 Word 合并相邻表格
