@@ -34,6 +34,9 @@ def main(argv=None):
                     default="auto", help="转换模式")
     ap.add_argument("-p", "--pages", help="页码范围，如 10-20 或 5,8,11（1-based）")
     ap.add_argument("--dpi", type=int, default=300, help="裁图/渲染 DPI（默认 300）")
+    ap.add_argument("--reocr", action="store_true",
+                    help="editable 模式：全页 RapidOCR 重识别替代扫描仪内置 "
+                         "OCR 层，正文错字更少（速度约慢 10-25s/页）")
     args = ap.parse_args(argv)
 
     doc = fitz.open(args.input)
@@ -67,12 +70,16 @@ def main(argv=None):
     else:
         from .editable import convert as conv
 
+    extra = {}
+    if mode in ("editable", "faithful"):
+        extra["dpi"] = args.dpi
+    if mode == "editable" and args.reocr:
+        extra["reocr"] = True
+
     if pages is not None:
-        conv(doc, out, pages=pages, progress=progress, **({"dpi": args.dpi}
-           if mode in ("editable", "faithful") else {}))
+        conv(doc, out, pages=pages, progress=progress, **extra)
     else:
-        conv(doc, out, progress=progress, **({"dpi": args.dpi}
-            if mode in ("editable", "faithful") else {}))
+        conv(doc, out, progress=progress, **extra)
 
     import os
     print(f"[book2docx] 完成: {out}  ({os.path.getsize(out)/1e6:.1f} MB, "

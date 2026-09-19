@@ -45,25 +45,60 @@ def _code_hint_line(t: str) -> bool:
 
 # ---------------------------------------------------------------- 单页分析
 
-def analyze_page(page: fitz.Page, dpi: int = 300) -> dict:
+def _words_from_full_ocr(img: np.ndarray, zoom: float) -> list[W]:
+    """在校正后的整页图上跑 RapidOCR，词块坐标为校正系 pt。"""
+    from .segment import rapidocr
+    result, _ = rapidocr()(img)
+    words: list[W] = []
+    for pts, text, conf in result or []:
+        t = str(text).strip()
+        if not t:
+            continue
+        xs = [q[0] for q in pts]
+        ys = [q[1] for q in pts]
+        words.append(W(min(xs) / zoom, min(ys) / zoom, max(xs) / zoom,
+                       max(ys) / zoom, t, (max(ys) - min(ys)) / zoom * 0.85,
+                       float(conf)))
+    return words
+
+
+def analyze_page(page: fitz.Page, dpi: int = 300, reocr: bool = False) -> dict:
     pr = page.rect
-    words0, source = get_words(page)
+    zoom0 = dpi / 72.0
+    if reocr:
+        # 全页 RapidOCR 重识别：在原始渲染图上检测文字，随后随 deskew 矩阵
+        # 变换坐标（与 PDF 层词块同一处理路径）
+        img0 = render_gray(page, dpi)
+        angle = estimate_skew(img0)
+        if abs(angle) > 0.05:
+            img, M = deskew(img0, angle)
+        else:
+            img, M = img0, np.array([[1.0, 0, 0], [0, 1.0, 0]])
+        words = _words_from_full_ocr(img, zoom0)
+        source = "rapidocr_full"
+        words0 = words
+    else:
+        words0, source = get_words(page)
+
     if not words0:
         return {"blocks": [], "margins": (72, 72, 72, 72), "base_h": 12.0,
-                "img": None, "page": pr}
+                "img": None, "page": pr, "words": [], "base_ink": 0.08,
+                "angle": 0.0, "source": source}
 
     zoom = dpi / 72.0
-    img0 = render_gray(page, dpi)
-    # 倾斜校正：扫描页常带 ~0.5° 旋转，斜表格线会破坏逐行检测
-    angle = estimate_skew(img0)
-    if abs(angle) > 0.05:
-        img, M = deskew(img0, angle)
-    else:
-        img, M = img0, np.array([[1.0, 0, 0], [0, 1.0, 0]])
-    words = []
-    for wd in words0:
-        nb = transform_pt_bbox([wd.x0, wd.y0, wd.x1, wd.y1], M, zoom)
-        words.append(W(nb[0], nb[1], nb[2], nb[3], wd.text, wd.size, wd.conf))
+    if not reocr:
+        img0 = render_gray(page, dpi)
+        # 倾斜校正：扫描页常带 ~0.5° 旋转，斜表格线会破坏逐行检测
+        angle = estimate_skew(img0)
+        if abs(angle) > 0.05:
+            img, M = deskew(img0, angle)
+        else:
+            img, M = img0, np.array([[1.0, 0, 0], [0, 1.0, 0]])
+        words = []
+        for wd in words0:
+            nb = transform_pt_bbox([wd.x0, wd.y0, wd.x1, wd.y1], M, zoom)
+            words.append(W(nb[0], nb[1], nb[2], nb[3], wd.text, wd.size, wd.conf))
+        words0 = words
 
     bw = binarize(img)
 
@@ -259,9 +294,27 @@ def analyze_page(page: fitz.Page, dpi: int = 300) -> dict:
     else:
         margins = (72, 72, 72, 72)
 
+    # 页面高度预算：Word 渲染的图段/表格行/段落间距都比原书排版略高，
+    # 累积导致溢出分页。估算渲染高度并对行距做整体压缩（下限 0.85）。
+    spacing_scale = 1.0
+    if body:
+        avail_h = pr.height - margins[0] - margins[1]
+        est_h = 0.0
+        for b in body:
+            bh = b.bbox[3] - b.bbox[1]
+            if b.kind in (BlockKind.FORMULA, BlockKind.IMAGE):
+                est_h += bh + 5          # 图片行 leading + 段距
+            elif b.kind == BlockKind.TABLE:
+                est_h += bh * 1.22       # 单元格 padding 累积
+            else:
+                est_h += bh + len(b.lines) * 1.2
+        if est_h > 0:
+            spacing_scale = min(1.0, max(0.85, avail_h * 0.97 / est_h))
+
     return {"blocks": out_blocks, "margins": margins, "base_h": base_h,
             "source": source, "page": pr, "img": img, "angle": angle,
-            "words": words, "base_ink": base_ink}
+            "words": words, "base_ink": base_ink,
+            "spacing_scale": spacing_scale}
 
 
 def _merge_overlapping_blocks(blocks: list[Block], base_h: float) -> list[Block]:
@@ -530,6 +583,7 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
     pr = analysis["page"]
     margins = analysis["margins"]
     base_h = analysis["base_h"]
+    spacing_scale = analysis.get("spacing_scale", 1.0)
     sec = document.sections[0] if first else document.add_section(WD_SECTION.NEW_PAGE)
     set_page(sec, pr.width, pr.height, margins)
 
@@ -566,7 +620,7 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
             if not ok:
                 p = document.add_paragraph()
                 p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-                _para_spacing(p, 0, 0)
+                _para_spacing(p, 0, 0, line_mult=1.0)
                 run = p.add_run()
                 data = crop(blk.bbox)
                 if data:
@@ -577,7 +631,7 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
         if blk.kind == BlockKind.IMAGE:
             p = document.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _para_spacing(p, 0, 0)
+            _para_spacing(p, 0, 0, line_mult=1.0)
             run = p.add_run()
             data = _crop_from(img, blk.bbox, zoom, trim=True)
             if data:
@@ -588,7 +642,7 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
         if blk.kind == BlockKind.FORMULA:
             p = document.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
-            _para_spacing(p, 0, 0)
+            _para_spacing(p, 0, 0, line_mult=1.0)
             run = p.add_run()
             fb = expand_to_ink(img, blk.bbox, zoom)
             data = _crop_from(img, fb, zoom, trim=True)
@@ -601,7 +655,7 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
         if blk.meta.get("code"):
             p = document.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
-            _para_spacing(p, 0, 0)
+            _para_spacing(p, 0, 0, line_mult=1.0)
             run = p.add_run()
             data = _crop_from(img, blk.bbox, zoom, trim=False)
             if data:
@@ -621,8 +675,8 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
                 p.alignment = _guess_align(para_lines, blk, base_h)
             if indent > base_h * 0.8 and blk.kind == BlockKind.TEXT:
                 p.paragraph_format.first_line_indent = Pt(indent)
-            # 行距：段内行 pitch 中位数
-            line_pt = _line_spacing(para_lines, base_h)
+            # 行距：段内行 pitch 中位数，按页面高度预算整体压缩
+            line_pt = _line_spacing(para_lines, base_h) * spacing_scale
             _para_spacing(p, 0, 0, exact_pt=line_pt)
 
             bold = blk.kind == BlockKind.HEADING
@@ -708,7 +762,7 @@ def _line_spacing(lines: list[Line], base_h: float) -> float:
 # ---------------------------------------------------------------- 主入口
 
 def convert(doc: fitz.Document, out_path: str, pages: range | None = None,
-            dpi: int = 300, progress=None):
+            dpi: int = 300, progress=None, reocr: bool = False):
     rng = pages if pages is not None else range(doc.page_count)
     document = Document()
     st = document.styles["Normal"]
@@ -723,7 +777,7 @@ def convert(doc: fitz.Document, out_path: str, pages: range | None = None,
             from .digital import build_page_digital
             build_page_digital(document, page, first=(k == 0))
         else:
-            analysis = analyze_page(page, dpi=dpi)
+            analysis = analyze_page(page, dpi=dpi, reocr=reocr)
             build_page(document, page, analysis, dpi=dpi, first=(k == 0))
         if progress:
             progress(i, len(rng))
