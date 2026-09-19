@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import io
+from pathlib import Path
 
 import cv2
 import fitz
@@ -579,7 +580,8 @@ def _table_borders(table):
 
 
 def build_page(document: Document, page: fitz.Page, analysis: dict,
-               dpi: int = 300, first: bool = False):
+               dpi: int = 300, first: bool = False,
+               formula_omml: bool = False):
     pr = analysis["page"]
     margins = analysis["margins"]
     base_h = analysis["base_h"]
@@ -640,12 +642,33 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
             continue
 
         if blk.kind == BlockKind.FORMULA:
+            # 公式 OCR → 原生 OMML 公式（路线图项）；失败回退高清裁图
+            omml_root = None
+            if formula_omml:
+                fb = expand_to_ink(img, blk.bbox, zoom)
+                data = _crop_from(img, fb, zoom, trim=True)
+                if data:
+                    try:
+                        from PIL import Image as _PILImage
+                        from .omml import (append_omml_to_paragraph,
+                                           image_to_latex, latex_plausible,
+                                           latex_to_omml_xml)
+                        im = _PILImage.open(io.BytesIO(data))
+                        latex = image_to_latex(im)
+                        if not latex_plausible(latex):
+                            raise ValueError("公式识别结果不合理")
+                        omml_root = latex_to_omml_xml(latex)
+                    except Exception:
+                        omml_root = None
             p = document.add_paragraph()
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             _para_spacing(p, 0, 0, line_mult=1.0)
-            run = p.add_run()
+            if omml_root is not None:
+                append_omml_to_paragraph(p, omml_root, body_size)
+                continue
             fb = expand_to_ink(img, blk.bbox, zoom)
             data = _crop_from(img, fb, zoom, trim=True)
+            run = p.add_run()
             if data:
                 run.add_picture(io.BytesIO(data),
                                 width=Emu(int((fb[2] - fb[0]) * 12700)))
@@ -761,25 +784,92 @@ def _line_spacing(lines: list[Line], base_h: float) -> float:
 
 # ---------------------------------------------------------------- 主入口
 
-def convert(doc: fitz.Document, out_path: str, pages: range | None = None,
-            dpi: int = 300, progress=None, reocr: bool = False):
-    rng = pages if pages is not None else range(doc.page_count)
+def _build_document(doc: fitz.Document, pages: range, dpi: int, reocr: bool,
+                    scale: float, progress=None,
+                    analysis_cache: dict | None = None,
+                    formula_omml: bool = False) -> Document:
+    """按指定行距压缩系数构建完整 Document（一遍）。"""
     document = Document()
     st = document.styles["Normal"]
     st.font.name = "Times New Roman"
     st.element.rPr.rFonts.set(qn("w:eastAsia"), "宋体")
     st.font.size = Pt(12)
 
-    for k, i in enumerate(rng):
+    for k, i in enumerate(pages):
         page = doc[i]
         info = classify_page(page)
         if info.kind == PageKind.DIGITAL:
             from .digital import build_page_digital
             build_page_digital(document, page, first=(k == 0))
         else:
-            analysis = analyze_page(page, dpi=dpi, reocr=reocr)
-            build_page(document, page, analysis, dpi=dpi, first=(k == 0))
+            cache_key = ("scan", i)
+            if analysis_cache is not None and cache_key in analysis_cache:
+                analysis = analysis_cache[cache_key]
+            else:
+                analysis = analyze_page(page, dpi=dpi, reocr=reocr)
+                if analysis_cache is not None:
+                    analysis_cache[cache_key] = analysis
+            analysis["spacing_scale"] = min(
+                analysis.get("spacing_scale", 1.0), scale)
+            build_page(document, page, analysis, dpi=dpi, first=(k == 0),
+                       formula_omml=formula_omml)
         if progress:
-            progress(i, len(rng))
-    document.save(out_path)
+            progress(i, len(pages))
+    return document
+
+
+def count_docx_pages(docx_path: str) -> int:
+    """用 Word COM 实测 docx 页数（不可用时返回 -1）。"""
+    try:
+        import pythoncom
+        import win32com.client
+        pythoncom.CoInitialize()
+        word = win32com.client.Dispatch("Word.Application")
+        word.Visible = False
+        try:
+            d = word.Documents.Open(str(Path(docx_path).resolve()), ReadOnly=True)
+            n = d.ComputeStatistics(2)          # wdStatisticPages
+            d.Close(False)
+            return int(n)
+        finally:
+            word.Quit()
+    except Exception:
+        return -1
+
+
+def convert(doc: fitz.Document, out_path: str, pages: range | None = None,
+            dpi: int = 300, progress=None, reocr: bool = False,
+            fit_target: int | None = None, fit_rounds: int = 2,
+            formula_omml: bool = False):
+    """editable 转换主入口。
+
+    fit_target: 期望页数（通常=原书页数）。给出时启用二遍排版：
+    每轮构建后用 Word 实测页数，超页则按实测比例回填行距压缩系数，
+    再用缓存的分析结果快速重建（不重跑 OCR）。
+    """
+    rng = pages if pages is not None else range(doc.page_count)
+    scale = 1.0
+    document = None
+    analysis_cache: dict = {}
+    attempts = (1 + max(0, fit_rounds)) if fit_target else 1
+    for attempt in range(attempts):
+        document = _build_document(doc, rng, dpi, reocr, scale,
+                                   progress, analysis_cache,
+                                   formula_omml=formula_omml)
+        document.save(out_path)
+        if not fit_target:
+            break
+        actual = count_docx_pages(out_path)
+        if actual < 0 or actual <= fit_target:
+            if actual > 0:
+                print(f"[book2docx] 二遍排版：实测 {actual} 页 ≤ 目标 "
+                      f"{fit_target} 页，无需压缩")
+            break
+        new_scale = scale * max(0.88, (fit_target / actual) ** 0.9)
+        if new_scale < 0.72 or abs(new_scale - scale) < 0.01:
+            print(f"[book2docx] 二遍排版：实测 {actual} 页，压缩到下限，停止")
+            break
+        print(f"[book2docx] 二遍排版：实测 {actual} 页 > 目标 {fit_target} 页，"
+              f"行距系数 {scale:.2f} → {new_scale:.2f}，重建…")
+        scale = new_scale
     return out_path

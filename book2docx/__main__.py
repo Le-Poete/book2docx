@@ -37,6 +37,13 @@ def main(argv=None):
     ap.add_argument("--reocr", action="store_true",
                     help="editable 模式：全页 RapidOCR 重识别替代扫描仪内置 "
                          "OCR 层，正文错字更少（速度约慢 10-25s/页）")
+    ap.add_argument("--omml", action="store_true",
+                    help="editable 模式：公式经 LaTeX-OCR 识别后转为 Word "
+                         "原生公式（可编辑；需本地 pix2tex + Office，失败自动"
+                         "回退高清裁图）")
+    ap.add_argument("--fit", action="store_true",
+                    help="editable 模式：二遍排版，用 Word 实测页数回填行距"
+                         "压缩系数，使页数与原书一致")
     args = ap.parse_args(argv)
 
     doc = fitz.open(args.input)
@@ -73,8 +80,15 @@ def main(argv=None):
     extra = {}
     if mode in ("editable", "faithful"):
         extra["dpi"] = args.dpi
-    if mode == "editable" and args.reocr:
-        extra["reocr"] = True
+    if mode == "editable":
+        if args.reocr:
+            extra["reocr"] = True
+        if args.omml:
+            extra["formula_omml"] = True
+        if args.fit:
+            # 目标页数 = 转换范围内的页数（与原书一致）
+            target = len(pages) if pages is not None else ana["page_count"]
+            extra["fit_target"] = target
 
     if pages is not None:
         conv(doc, out, pages=pages, progress=progress, **extra)
