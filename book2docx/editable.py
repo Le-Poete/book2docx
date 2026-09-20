@@ -466,8 +466,13 @@ def _trim_partial_lines(roi: np.ndarray) -> np.ndarray:
 
 
 def _crop_from(img: np.ndarray, bbox_pt: list, zoom: float, pad_pt: float = 1.0,
-               trim: bool = False) -> bytes:
-    """从（已校正的）页面灰度图按 pt bbox 裁图，白底化。"""
+               trim: bool = False,
+               exclude_pt: list[list] | None = None) -> bytes:
+    """从（已校正的）页面灰度图按 pt bbox 裁图，白底化。
+
+    exclude_pt: 需要涂白的行框列表（pt）——用于抹除裁图区域内
+    属于其他行/块的墨迹，防止裁图与正文文本重复显示。
+    """
     x0, y0, x1, y1 = [int(v * zoom) for v in bbox_pt]
     pad = int(pad_pt * zoom)
     x0, y0 = max(0, x0 - pad), max(0, y0 - pad)
@@ -475,7 +480,16 @@ def _crop_from(img: np.ndarray, bbox_pt: list, zoom: float, pad_pt: float = 1.0,
     y1 = min(img.shape[0], y1 + pad)
     if x1 <= x0 or y1 <= y0:
         return b""
-    roi = img[y0:y1, x0:x1]
+    roi = img[y0:y1, x0:x1].copy()
+    if exclude_pt:
+        h, w = roi.shape
+        for eb in exclude_pt:
+            ex0 = max(0, int(eb[0] * zoom) - x0 - 1)
+            ey0 = max(0, int(eb[1] * zoom) - y0 - 1)
+            ex1 = min(w, int(eb[2] * zoom) - x0 + 1)
+            ey1 = min(h, int(eb[3] * zoom) - y0 + 1)
+            if ex1 > ex0 and ey1 > ey0:
+                roi[ey0:ey1, ex0:ex1] = 255
     roi = np.where(roi > 190, 255, roi).astype(np.uint8)
     if trim:
         roi = _trim_partial_lines(roi)
@@ -643,6 +657,19 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
     def crop(bbox):
         return _crop_from(img, bbox, zoom)
 
+    # 裁图排除区：所有其他 TEXT/SKIP 块的行框（涂白，防止裁图
+    # 罩住相邻正文墨迹造成"文本+图"重复显示）
+    def excl_for(bbox):
+        excl = []
+        for ob in all_blocks:
+            if ob is blk or ob.kind not in (BlockKind.TEXT, BlockKind.SKIP,
+                                            BlockKind.HEADING):
+                continue
+            for ln in ob.lines:
+                if _overlap_ratio(ln.bbox, bbox) > 0:
+                    excl.append(ln.bbox)
+        return excl
+
     body_size = _body_font_size(analysis, base_h)
     all_blocks = analysis["blocks"]
 
@@ -672,7 +699,8 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
             p.alignment = WD_ALIGN_PARAGRAPH.CENTER
             _para_spacing(p, 0, 0, line_mult=1.0)
             run = p.add_run()
-            data = _crop_from(img, blk.bbox, zoom, trim=True)
+            data = _crop_from(img, blk.bbox, zoom, trim=True,
+                              exclude_pt=excl_for(blk.bbox))
             if data:
                 run.add_picture(io.BytesIO(data),
                                 width=Emu(int((blk.bbox[2] - blk.bbox[0]) * 12700)))
@@ -683,7 +711,8 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
             omml_root = None
             if formula_omml:
                 fb = expand_to_ink(img, blk.bbox, zoom)
-                data = _crop_from(img, fb, zoom, trim=True)
+                data = _crop_from(img, fb, zoom, trim=True,
+                                  exclude_pt=excl_for(fb))
                 if data:
                     try:
                         from PIL import Image as _PILImage
@@ -704,7 +733,8 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
                 append_omml_to_paragraph(p, omml_root, body_size)
                 continue
             fb = expand_to_ink(img, blk.bbox, zoom)
-            data = _crop_from(img, fb, zoom, trim=True)
+            data = _crop_from(img, fb, zoom, trim=True,
+                              exclude_pt=excl_for(fb))
             run = p.add_run()
             if data:
                 run.add_picture(io.BytesIO(data),
@@ -717,7 +747,8 @@ def build_page(document: Document, page: fitz.Page, analysis: dict,
             p.alignment = WD_ALIGN_PARAGRAPH.LEFT
             _para_spacing(p, 0, 0, line_mult=1.0)
             run = p.add_run()
-            data = _crop_from(img, blk.bbox, zoom, trim=False)
+            data = _crop_from(img, blk.bbox, zoom, trim=False,
+                              exclude_pt=excl_for(blk.bbox))
             if data:
                 run.add_picture(io.BytesIO(data),
                                 width=Emu(int((blk.bbox[2] - blk.bbox[0]) * 12700)))
